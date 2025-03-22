@@ -27,7 +27,8 @@
         "vite": "^6.2.2",
         "tsup": "^8.4.0",
         "p-limit": "^6.2.0",
-        "vike-server": "1.0.0-beta.2"
+        "vike-server": "1.0.0-beta.2",
+        "@brillout/json-serializer": "0.5.15"
     },
     "dependencies": {
         "@vercel/nft": "^0.29.2"

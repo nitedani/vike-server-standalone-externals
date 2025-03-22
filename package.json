@@ -1,13 +1,15 @@
 {
-    "name": "",
+    "name": "vike-server-standalone-externals",
     "private": true,
     "version": "0.0.0",
     "type": "module",
     "pnpm": {
         "overrides": {
             "vike-server-standalone-externals": "link:./packages/vike-server-standalone-externals/",
-            "lodash_exporter_1": "link:./test/lodash_exporter_1/",
-            "lodash_exporter_2": "link:./test/lodash_exporter_2/"
+            "package1": "link:./test/package1/",
+            "package2": "link:./test/package2/",
+            "package3": "link:./test/package3/",
+            "package999": "link:./test/package_with_a_wrong_name/"
         }
     },
     "devDependencies": {

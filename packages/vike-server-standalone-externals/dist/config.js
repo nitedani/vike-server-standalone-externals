@@ -153,12 +153,10 @@ var DEFAULT_EXTERNALS = ["@node-rs/argon2", "@prisma/client", "sharp"];
 function assert(condition) {
   if (condition) return;
   throw new Error(
-    "You stumbled upon a bug in vike-server-externals's source code. Reach out on GitHub and we will fix the bug."
+    "You stumbled upon a bug in vike-server-externals's source code. Please report this issue on GitHub."
   );
 }
 function toPosixPath(path2) {
-  assert(path2 !== void 0 && path2 !== null);
-  assert(typeof path2 === "string");
   const pathPosix = path2.split("\\").join("/");
   assertPosixPath(pathPosix);
   return pathPosix;
@@ -175,12 +173,13 @@ function standaloneExternals() {
     name: "vike-server-standalone-externals",
     apply: "build",
     applyToEnvironment: (env) => env.name === "ssr",
-    // Configure externals during build
+    /**
+     * Configure external packages during build
+     */
     config(config2) {
       assert(config2);
       const vikeConfig = getVikeConfig(config2);
-      assert(vikeConfig);
-      assert(vikeConfig.config);
+      assert(vikeConfig?.config);
       const serverConfig = vikeConfig.config.server?.[0];
       const standaloneConfig = typeof serverConfig === "object" && serverConfig !== null ? serverConfig.standalone : void 0;
       if (!standaloneConfig) return;
@@ -199,24 +198,12 @@ function standaloneExternals() {
       order: "post",
       async handler() {
         const config2 = this.environment.config;
-        assert(config2);
-        assert(config2.root);
-        assert(config2.build);
-        assert(config2.build.outDir);
+        assert(config2?.root && config2?.build?.outDir);
         const root = toPosixPath(config2.root);
         const outDir = toPosixPath(config2.build.outDir);
         const outDirAbs = path.isAbsolute(outDir) ? outDir : path.join(root, outDir);
-        assertPosixPath(outDirAbs);
         const files = await fs.readdir(outDirAbs);
-        assert(Array.isArray(files));
-        const standaloneFiles = files.filter((file) => {
-          assert(typeof file === "string");
-          return file.includes(".standalone.");
-        }).map((file) => {
-          const fullPath = path.join(outDirAbs, file);
-          assertPosixPath(toPosixPath(fullPath));
-          return fullPath;
-        });
+        const standaloneFiles = files.filter((file) => file.includes(".standalone.")).map((file) => path.join(outDirAbs, file));
         if (standaloneFiles.length === 0) return;
         await processStandalone(standaloneFiles, root, outDirAbs);
       }
@@ -226,77 +213,89 @@ function standaloneExternals() {
 async function processStandalone(standaloneFiles, root, outDirAbs) {
   assert(Array.isArray(standaloneFiles));
   assert(standaloneFiles.every((file) => typeof file === "string"));
-  assertPosixPath(root);
-  assertPosixPath(outDirAbs);
+  assert(typeof root === "string");
+  assert(typeof outDirAbs === "string");
   console.log("Processing standalone build dependencies...");
   if (isYarnPnP()) {
     console.warn("Yarn PnP is not supported for standalone builds.");
     return;
   }
   const workspaceRoot = toPosixPath(searchForWorkspaceRoot(root));
-  assertPosixPath(workspaceRoot);
-  const dependencies = await traceDependencies(
+  const { dependencies, dependencyInfo } = await traceDependencies(
     standaloneFiles,
     workspaceRoot,
     outDirAbs
   );
   if (dependencies.length === 0) return;
   const packageInfo = await analyzePackages(dependencies, workspaceRoot);
-  assert(packageInfo);
-  assert(packageInfo.versionCounts instanceof Map);
-  assert(packageInfo.workspacePackages instanceof Map);
-  await copyDependencies(dependencies, workspaceRoot, outDirAbs, packageInfo);
+  assert(packageInfo?.versionCounts instanceof Map);
+  assert(packageInfo?.workspacePackages instanceof Map);
+  await copyDependencies(
+    dependencies,
+    workspaceRoot,
+    outDirAbs,
+    packageInfo,
+    dependencyInfo
+  );
   console.log("Standalone build dependencies processed successfully!");
 }
 async function traceDependencies(entryFiles, workspaceRoot, outDirAbs) {
   assert(Array.isArray(entryFiles));
   assert(entryFiles.every((file) => typeof file === "string"));
-  assertPosixPath(workspaceRoot);
-  assertPosixPath(outDirAbs);
+  assert(typeof workspaceRoot === "string");
+  assert(typeof outDirAbs === "string");
   const result = await nodeFileTrace(entryFiles, { base: workspaceRoot });
-  assert(result);
-  assert(result.fileList);
-  assert(result.reasons);
+  assert(result?.fileList && result?.reasons);
   const relOutDir = path.relative(workspaceRoot, outDirAbs);
-  assertPosixPath(toPosixPath(relOutDir));
-  const dependencies = [...result.fileList].filter((file) => {
-    assert(typeof file === "string");
-    const reasons = result.reasons.get(file);
-    return !reasons?.type.includes("initial") && !file.startsWith("usr/") && !file.startsWith(relOutDir);
-  }).map((file) => {
-    const normalized = toPosixPath(file);
-    return normalized;
-  });
+  const dependencies = [...result.fileList].filter(
+    (file) => (
+      // Skip initial files, system files, and files already in output directory
+      !result.reasons.get(file)?.type.includes("initial") && !file.startsWith("usr/") && !file.startsWith(relOutDir)
+    )
+  ).map(toPosixPath);
   assert(Array.isArray(dependencies));
   assert(dependencies.every((dep) => typeof dep === "string"));
+  const dependencyInfo = buildDependencyGraph(dependencies, result.reasons);
   console.log(`Found ${dependencies.length} dependencies to copy`);
-  return dependencies;
+  return { dependencies, dependencyInfo };
+}
+function buildDependencyGraph(files, reasons) {
+  const importedBy = /* @__PURE__ */ new Map();
+  const imports = /* @__PURE__ */ new Map();
+  for (const file of files) {
+    importedBy.set(file, /* @__PURE__ */ new Set());
+    imports.set(file, /* @__PURE__ */ new Set());
+  }
+  for (const file of files) {
+    const reason = reasons.get(file);
+    if (!reason?.parents) continue;
+    for (const parent of reason.parents) {
+      if (!files.includes(parent)) continue;
+      importedBy.get(file)?.add(parent);
+      imports.get(parent)?.add(file);
+    }
+  }
+  return { importedBy, imports };
 }
 async function analyzePackages(files, workspaceRoot) {
   assert(Array.isArray(files));
   assert(files.every((file) => typeof file === "string"));
-  assertPosixPath(workspaceRoot);
+  assert(typeof workspaceRoot === "string");
   const packageLocations = /* @__PURE__ */ new Map();
   const workspacePackages = /* @__PURE__ */ new Map();
   for (const file of files) {
     if (!file.endsWith("package.json")) continue;
     try {
       const fullPath = path.join(workspaceRoot, file);
-      assertPosixPath(toPosixPath(fullPath));
       const content = await fs.readFile(fullPath, "utf-8");
-      assert(typeof content === "string");
       const pkg = JSON.parse(content);
-      assert(pkg);
       if (!pkg.name) continue;
       assert(typeof pkg.name === "string");
       const dir = path.dirname(file);
-      assertPosixPath(toPosixPath(dir));
       if (!packageLocations.has(pkg.name)) {
         packageLocations.set(pkg.name, /* @__PURE__ */ new Set());
       }
-      const locations = packageLocations.get(pkg.name);
-      assert(locations instanceof Set);
-      locations.add(dir);
+      packageLocations.get(pkg.name).add(dir);
       if (!file.includes("node_modules/")) {
         workspacePackages.set(dir, pkg.name);
       }
@@ -306,39 +305,49 @@ async function analyzePackages(files, workspaceRoot) {
   }
   const versionCounts = /* @__PURE__ */ new Map();
   for (const [name, locations] of packageLocations.entries()) {
-    assert(typeof name === "string");
-    assert(locations instanceof Set);
     versionCounts.set(name, locations.size);
   }
   return { versionCounts, workspacePackages };
 }
-async function copyDependencies(files, workspaceRoot, outDirAbs, packageInfo) {
+async function copyDependencies(files, workspaceRoot, outDirAbs, packageInfo, dependencyInfo) {
   assert(Array.isArray(files));
   assert(files.every((file) => typeof file === "string"));
-  assertPosixPath(workspaceRoot);
-  assertPosixPath(outDirAbs);
-  assert(packageInfo);
-  assert(packageInfo.versionCounts instanceof Map);
-  assert(packageInfo.workspacePackages instanceof Map);
+  assert(typeof workspaceRoot === "string");
+  assert(typeof outDirAbs === "string");
+  assert(packageInfo?.versionCounts instanceof Map);
+  assert(packageInfo?.workspacePackages instanceof Map);
+  const destPaths = /* @__PURE__ */ new Map();
+  const relocatedFiles = /* @__PURE__ */ new Map();
+  for (const file of files) {
+    const destPath = mapFilePath(file, outDirAbs, packageInfo);
+    destPaths.set(file, destPath);
+    if (path.join(outDirAbs, file) !== destPath) {
+      relocatedFiles.set(file, destPath);
+    }
+  }
+  for (const [file, destPath] of relocatedFiles) {
+    adjustPathsForRelativeImports(
+      file,
+      destPath,
+      dependencyInfo,
+      destPaths,
+      workspaceRoot,
+      outDirAbs
+    );
+  }
   const limit = pLimit(10);
   const processed = /* @__PURE__ */ new Set();
   await Promise.all(
     files.map(
       (file) => limit(async () => {
         try {
-          assert(typeof file === "string");
           const sourcePath = path.join(workspaceRoot, file);
-          assertPosixPath(toPosixPath(sourcePath));
+          const destPath = destPaths.get(file);
           const stats = await fs.stat(sourcePath);
-          assert(stats);
           if (stats.isDirectory()) return;
-          const destPath = mapFilePath(file, outDirAbs, packageInfo);
-          assertPosixPath(toPosixPath(destPath));
           if (processed.has(destPath)) return;
           processed.add(destPath);
-          const destDir = path.dirname(destPath);
-          assertPosixPath(toPosixPath(destDir));
-          await fs.mkdir(destDir, { recursive: true });
+          await fs.mkdir(path.dirname(destPath), { recursive: true });
           await fs.cp(sourcePath, destPath, { dereference: true });
         } catch (err) {
           console.warn(`Error copying ${file}:`, err);
@@ -347,13 +356,35 @@ async function copyDependencies(files, workspaceRoot, outDirAbs, packageInfo) {
     )
   );
 }
+function adjustPathsForRelativeImports(sourceFile, destPath, dependencyInfo, destPaths, workspaceRoot, outDirAbs) {
+  const importedFiles = dependencyInfo.imports.get(sourceFile);
+  if (!importedFiles || importedFiles.size === 0) return;
+  const sourceDir = path.dirname(sourceFile);
+  const destDir = path.dirname(destPath);
+  for (const importedFile of importedFiles) {
+    const relPathFromSource = path.relative(sourceDir, importedFile);
+    if (relPathFromSource.startsWith("..") || relPathFromSource.startsWith(".")) {
+      const newImportDest = path.join(destDir, relPathFromSource);
+      const currentDest = destPaths.get(importedFile);
+      if (currentDest && !currentDest.includes("/node_modules/")) {
+        destPaths.set(importedFile, newImportDest);
+        adjustPathsForRelativeImports(
+          importedFile,
+          newImportDest,
+          dependencyInfo,
+          destPaths,
+          workspaceRoot,
+          outDirAbs
+        );
+      }
+    }
+  }
+}
 function mapFilePath(file, outDirAbs, packageInfo) {
   assert(typeof file === "string");
-  assertPosixPath(file);
-  assertPosixPath(outDirAbs);
-  assert(packageInfo);
-  assert(packageInfo.versionCounts instanceof Map);
-  assert(packageInfo.workspacePackages instanceof Map);
+  assert(typeof outDirAbs === "string");
+  assert(packageInfo?.versionCounts instanceof Map);
+  assert(packageInfo?.workspacePackages instanceof Map);
   if (file.includes("node_modules/")) {
     const parts = file.split("node_modules/").filter(Boolean);
     assert(Array.isArray(parts));
@@ -364,20 +395,17 @@ function mapFilePath(file, outDirAbs, packageInfo) {
     assert(typeof lastPart === "string");
     const packageName = extractPackageName(lastPart);
     if (packageName) {
-      assert(typeof packageName === "string");
       const versionCount = packageInfo.versionCounts.get(packageName);
       if (versionCount === 1) {
         const pathAfterPackage = lastPart.substring(
           lastPart.indexOf(packageName) + packageName.length
         );
-        const destPath2 = path.join(
+        return path.join(
           outDirAbs,
           "node_modules",
           packageName,
           pathAfterPackage
         );
-        assertPosixPath(toPosixPath(destPath2));
-        return destPath2;
       }
     }
   }
@@ -389,14 +417,12 @@ function mapFilePath(file, outDirAbs, packageInfo) {
     assert(workspaceMatch.packageName);
     assert(typeof workspaceMatch.packageName === "string");
     assert(typeof workspaceMatch.relativePath === "string");
-    const destPath2 = path.join(
+    return path.join(
       outDirAbs,
       "node_modules",
       workspaceMatch.packageName,
       workspaceMatch.relativePath
     );
-    assertPosixPath(toPosixPath(destPath2));
-    return destPath2;
   }
   if (file.includes("node_modules/")) {
     const parts = file.split("node_modules/").filter(Boolean);
@@ -406,13 +432,9 @@ function mapFilePath(file, outDirAbs, packageInfo) {
     }
     const lastPart = parts[parts.length - 1];
     assert(typeof lastPart === "string");
-    const destPath2 = path.join(outDirAbs, "node_modules", lastPart);
-    assertPosixPath(toPosixPath(destPath2));
-    return destPath2;
+    return path.join(outDirAbs, "node_modules", lastPart);
   }
-  const destPath = path.join(outDirAbs, file);
-  assertPosixPath(toPosixPath(destPath));
-  return destPath;
+  return path.join(outDirAbs, file);
 }
 function findWorkspaceMatch(file, workspacePackages) {
   assert(typeof file === "string");
@@ -443,9 +465,7 @@ function extractPackageName(pathStr) {
   if (firstPart.startsWith("@")) {
     const secondSlash = pathStr.indexOf("/", firstSlash + 1);
     if (secondSlash !== -1) {
-      const scopedName = pathStr.substring(0, secondSlash);
-      assert(typeof scopedName === "string");
-      return scopedName;
+      return pathStr.substring(0, secondSlash);
     }
   }
   return firstPart;

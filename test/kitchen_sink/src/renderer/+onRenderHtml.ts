@@ -1,6 +1,11 @@
 import { dangerouslySkipEscape } from "vike/server";
 import "lodash";
-import "lodash_exporter_1";
+import "package1";
+import { hashSync } from "package3";
+import { one } from "../../../non_package/test-utils.js";
+console.log(`one: ${one}`);
+import { two } from "package999";
+console.log(`two: ${two}`);
 
 export const onRenderHtml = () => {
   return {
@@ -10,7 +15,7 @@ export const onRenderHtml = () => {
         <title>My SSR App</title>
       </head>
       <body>
-        <div id="page-root">OK</div>
+        <div id="page-root">${hashSync("test")}</div>
       </body>
     </html>
   `),

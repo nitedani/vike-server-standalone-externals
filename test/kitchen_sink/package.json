@@ -20,6 +20,9 @@
     "vite": "^6.2.2",
     "vike-server-standalone-externals": "1.0.0",
     "lodash": "4.17.21",
-    "lodash_exporter_1": "*"
+    "package1": "*",
+    "package2": "*",
+    "package3": "*",
+    "package999": "*"
   }
 }

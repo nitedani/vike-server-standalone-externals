@@ -8,7 +8,14 @@ export default {
     entry: "src/server/index.ts",
     standalone: {
       esbuild: {
-        external: ["@node-rs/argon2", "lodash", "lodash_exporter_1"],
+        external: [
+          "@node-rs/argon2",
+          "lodash",
+          "package1",
+          "package2",
+          "package3",
+          "package999",
+        ],
       },
     },
   },

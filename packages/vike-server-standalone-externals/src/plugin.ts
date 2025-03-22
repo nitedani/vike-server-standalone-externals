@@ -12,6 +12,11 @@
  *    - Move workspace packages (those not in node_modules) to node_modules/[packageName]
  *    - Preserve their internal file structure
  *
+ * 3. RELATIVE IMPORT PRESERVATION:
+ *    - When a file is moved according to Rules 1 or 2, any files it imports via relative paths
+ *      are also relocated to maintain the correct relative path relationship
+ *    - This ensures that relative imports continue to work after relocation
+ *
  * The result is a minimal, correctly resolved dependency tree that maintains Node.js module resolution
  * compatibility while avoiding unnecessary duplication.
  */
@@ -24,6 +29,16 @@ import pLimit from "p-limit";
 
 // Default external packages that should not be bundled
 const DEFAULT_EXTERNALS = ["@node-rs/argon2", "@prisma/client", "sharp"];
+
+/**
+ * Represents information about imported file relationships
+ */
+interface DependencyInfo {
+  /** Map from file to the set of files that import it */
+  importedBy: Map<string, Set<string>>;
+  /** Map from file to the set of files it imports */
+  imports: Map<string, Set<string>>;
+}
 
 /**
  * Package information collected during analysis phase
@@ -60,7 +75,7 @@ function assertUsage(condition: unknown, message: string): asserts condition {
 
 /**
  * Converts a path to POSIX format for cross-platform compatibility
- * @param filePath - Path to convert
+ * @param path - Path to convert
  * @returns Path with forward slashes
  */
 function toPosixPath(path: string): string {
@@ -68,6 +83,11 @@ function toPosixPath(path: string): string {
   assertPosixPath(pathPosix);
   return pathPosix;
 }
+
+/**
+ * Asserts that a path is in valid POSIX format
+ * @param path - Path to validate
+ */
 function assertPosixPath(path: string): void {
   assert(path !== null);
   assert(typeof path === "string");
@@ -174,12 +194,13 @@ async function processStandalone(
 
   const workspaceRoot = toPosixPath(searchForWorkspaceRoot(root));
 
-  // Step 1: Trace dependencies
-  const dependencies = await traceDependencies(
+  // Step 1: Trace dependencies and build dependency graph
+  const { dependencies, dependencyInfo } = await traceDependencies(
     standaloneFiles,
     workspaceRoot,
     outDirAbs
   );
+  
   if (dependencies.length === 0) return;
 
   // Step 2: Analyze packages and count versions
@@ -188,7 +209,13 @@ async function processStandalone(
   assert(packageInfo?.workspacePackages instanceof Map);
 
   // Step 3: Copy dependencies with proper path mapping
-  await copyDependencies(dependencies, workspaceRoot, outDirAbs, packageInfo);
+  await copyDependencies(
+    dependencies,
+    workspaceRoot,
+    outDirAbs,
+    packageInfo,
+    dependencyInfo
+  );
 
   console.log("Standalone build dependencies processed successfully!");
 }
@@ -198,13 +225,13 @@ async function processStandalone(
  * @param entryFiles - List of entry files to trace from
  * @param workspaceRoot - Root of the workspace
  * @param outDirAbs - Output directory to exclude
- * @returns List of file paths that need to be copied
+ * @returns List of file paths that need to be copied and their dependency info
  */
 async function traceDependencies(
   entryFiles: string[],
   workspaceRoot: string,
   outDirAbs: string
-): Promise<string[]> {
+): Promise<{ dependencies: string[]; dependencyInfo: DependencyInfo }> {
   assert(Array.isArray(entryFiles));
   assert(entryFiles.every((file) => typeof file === "string"));
   assert(typeof workspaceRoot === "string");
@@ -230,8 +257,53 @@ async function traceDependencies(
   assert(Array.isArray(dependencies));
   assert(dependencies.every((dep) => typeof dep === "string"));
 
+  // Build dependency relationships
+  const dependencyInfo = buildDependencyGraph(dependencies, result.reasons);
+
   console.log(`Found ${dependencies.length} dependencies to copy`);
-  return dependencies;
+  
+  return { dependencies, dependencyInfo };
+}
+
+/**
+ * Builds a dependency graph from tracing results
+ * @param files - List of files
+ * @param reasons - Reasons map from nodeFileTrace
+ * @returns Dependency information with relationships between files
+ */
+function buildDependencyGraph(
+  files: string[],
+  reasons: Map<string, { type: string[], parents?: Set<string> }>
+): DependencyInfo {
+  // Maps from file to the set of files that import it
+  const importedBy = new Map<string, Set<string>>();
+  
+  // Maps from file to the set of files it imports
+  const imports = new Map<string, Set<string>>();
+  
+  // Initialize empty sets for all files
+  for (const file of files) {
+    importedBy.set(file, new Set());
+    imports.set(file, new Set());
+  }
+  
+  // Build the relationships
+  for (const file of files) {
+    const reason = reasons.get(file);
+    if (!reason?.parents) continue;
+    
+    for (const parent of reason.parents) {
+      if (!files.includes(parent)) continue;
+      
+      // This file is imported by the parent
+      importedBy.get(file)?.add(parent);
+      
+      // The parent imports this file
+      imports.get(parent)?.add(file);
+    }
+  }
+  
+  return { importedBy, imports };
 }
 
 /**
@@ -297,12 +369,14 @@ async function analyzePackages(
  * @param workspaceRoot - Root of the workspace
  * @param outDirAbs - Output directory
  * @param packageInfo - Package information
+ * @param dependencyInfo - Dependency graph information
  */
 async function copyDependencies(
   files: string[],
   workspaceRoot: string,
   outDirAbs: string,
-  packageInfo: PackageInfo
+  packageInfo: PackageInfo,
+  dependencyInfo: DependencyInfo
 ): Promise<void> {
   assert(Array.isArray(files));
   assert(files.every((file) => typeof file === "string"));
@@ -311,6 +385,37 @@ async function copyDependencies(
   assert(packageInfo?.versionCounts instanceof Map);
   assert(packageInfo?.workspacePackages instanceof Map);
 
+  // First, determine the destination paths for all files
+  const destPaths = new Map<string, string>();
+  
+  // Track which files will be relocated
+  const relocatedFiles = new Map<string, string>();
+  
+  // First pass: determine destination paths based on primary rules
+  for (const file of files) {
+    const destPath = mapFilePath(file, outDirAbs, packageInfo);
+    destPaths.set(file, destPath);
+    
+    // If the file is being relocated (not just copied to the same relative path)
+    if (path.join(outDirAbs, file) !== destPath) {
+      relocatedFiles.set(file, destPath);
+    }
+  }
+  
+  // Second pass: adjust paths for relative imports
+  for (const [file, destPath] of relocatedFiles) {
+    // Find files imported by this file via relative paths
+    adjustPathsForRelativeImports(
+      file,
+      destPath,
+      dependencyInfo,
+      destPaths,
+      workspaceRoot,
+      outDirAbs
+    );
+  }
+  
+  // Now copy all files to their final destinations
   const limit = pLimit(10); // Limit concurrent file operations
   const processed = new Set<string>();
 
@@ -319,13 +424,11 @@ async function copyDependencies(
       limit(async () => {
         try {
           const sourcePath = path.join(workspaceRoot, file);
+          const destPath = destPaths.get(file)!;
 
           // Skip directories
           const stats = await fs.stat(sourcePath);
           if (stats.isDirectory()) return;
-
-          // Map source path to destination
-          const destPath = mapFilePath(file, outDirAbs, packageInfo);
 
           // Skip if already processed
           if (processed.has(destPath)) return;
@@ -340,6 +443,59 @@ async function copyDependencies(
       })
     )
   );
+}
+
+/**
+ * Adjusts destination paths to preserve relative imports for a relocated file
+ * @param sourceFile - The file being relocated
+ * @param destPath - The destination path for the source file
+ * @param dependencyInfo - The dependency graph information
+ * @param destPaths - Map of file paths to their destinations
+ * @param workspaceRoot - The workspace root
+ * @param outDirAbs - The output directory
+ */
+function adjustPathsForRelativeImports(
+  sourceFile: string,
+  destPath: string,
+  dependencyInfo: DependencyInfo,
+  destPaths: Map<string, string>,
+  workspaceRoot: string,
+  outDirAbs: string
+) {
+  // Get files that this file imports
+  const importedFiles = dependencyInfo.imports.get(sourceFile);
+  if (!importedFiles || importedFiles.size === 0) return;
+  
+  const sourceDir = path.dirname(sourceFile);
+  const destDir = path.dirname(destPath);
+  
+  for (const importedFile of importedFiles) {
+    // Check if this is likely a relative import (simple heuristic)
+    const relPathFromSource = path.relative(sourceDir, importedFile);
+    
+    // If it starts with .. or ., it's probably a relative import
+    if (relPathFromSource.startsWith('..') || relPathFromSource.startsWith('.')) {
+      // Preserve the relative relationship by placing the imported file
+      // at the same relative location from the new destination
+      const newImportDest = path.join(destDir, relPathFromSource);
+      
+      // Only update if not already relocated to a workspace package or hoisted
+      const currentDest = destPaths.get(importedFile);
+      if (currentDest && !currentDest.includes('/node_modules/')) {
+        destPaths.set(importedFile, newImportDest);
+        
+        // Recursively adjust for files imported by this file
+        adjustPathsForRelativeImports(
+          importedFile,
+          newImportDest,
+          dependencyInfo,
+          destPaths,
+          workspaceRoot,
+          outDirAbs
+        );
+      }
+    }
+  }
 }
 
 /**
