@@ -20,15 +20,43 @@
  * The result is a minimal, correctly resolved dependency tree that maintains Node.js module resolution
  * compatibility while avoiding unnecessary duplication.
  */
-import { searchForWorkspaceRoot, type Plugin } from "vite";
-import { getVikeConfig } from "vike/plugin";
+
+// -----------------------------------------------------------------------------
+// Imports
+// -----------------------------------------------------------------------------
+
+// Node.js core modules (alphabetical order)
 import path from "node:path";
 import fs from "node:fs/promises";
+
+// Third-party dependencies (alphabetical order)
+import { searchForWorkspaceRoot, type Plugin } from "vite";
+import { getVikeConfig } from "vike/plugin";
 import { nodeFileTrace } from "@vercel/nft";
 import pLimit from "p-limit";
 
-// Default external packages that should not be bundled
+// -----------------------------------------------------------------------------
+// Constants
+// -----------------------------------------------------------------------------
+
+/**
+ * Default external packages that should not be bundled
+ * 
+ * These packages are excluded from bundling because:
+ * - They contain native/binary components that can't be properly bundled
+ * - They're significantly large and rarely change, so bundling provides little benefit
+ * - They may have special loading requirements or side effects that break when bundled
+ * 
+ * Example:
+ * - @node-rs/argon2: Contains native Rust bindings for argon2 hashing
+ * - @prisma/client: Dynamically loads generated DB client code, contains native Rust bindings for the query engine
+ * - sharp: Contains native image processing dependencies
+ */
 const DEFAULT_EXTERNALS = ["@node-rs/argon2", "@prisma/client", "sharp"];
+
+// -----------------------------------------------------------------------------
+// Type Definitions
+// -----------------------------------------------------------------------------
 
 /**
  * Represents information about imported file relationships
@@ -51,53 +79,25 @@ interface PackageInfo {
 }
 
 /**
- * Assert helper for internal errors
- * @param condition - Condition to check
- * @throws Error if condition is falsy
+ * Parsed reason information from nodeFileTrace
  */
-function assert(condition: unknown): asserts condition {
-  if (condition) return;
-  throw new Error(
-    "You stumbled upon a bug in vike-server-externals's source code. Please report this issue on GitHub."
-  );
+interface TraceReason {
+  /** Type of the file (e.g., 'initial', 'dependency') */
+  type: string[];
+  /** Set of files that import this file */
+  parents?: Set<string>;
 }
 
-/**
- * Assert helper for usage errors
- * @param condition - Condition to check
- * @param message - Error message to display
- * @throws Error if condition is falsy
- */
-function assertUsage(condition: unknown, message: string): asserts condition {
-  if (condition) return;
-  throw new Error(`[vike-server-externals][Wrong Usage] ${message}`);
-}
-
-/**
- * Converts a path to POSIX format for cross-platform compatibility
- * @param path - Path to convert
- * @returns Path with forward slashes
- */
-function toPosixPath(path: string): string {
-  const pathPosix = path.split("\\").join("/");
-  assertPosixPath(pathPosix);
-  return pathPosix;
-}
-
-/**
- * Asserts that a path is in valid POSIX format
- * @param path - Path to validate
- */
-function assertPosixPath(path: string): void {
-  assert(path !== null);
-  assert(typeof path === "string");
-  assert(path !== "");
-  assert(path);
-  assert(!path.includes("\\"));
-}
+// -----------------------------------------------------------------------------
+// Main Plugin Export
+// -----------------------------------------------------------------------------
 
 /**
  * Creates the standalone externals plugin
+ * 
+ * This plugin handles dependencies for standalone server builds by correctly
+ * hoisting and mapping packages according to their versions and workspace structure.
+ * 
  * @returns Vite plugin instance
  */
 export function standaloneExternals(): Plugin {
@@ -108,12 +108,26 @@ export function standaloneExternals(): Plugin {
 
     /**
      * Configure external packages during build
+     * 
+     * This hook runs before the build starts and modifies the Vite config
+     * to exclude certain packages from being bundled into the final output.
+     * 
+     * The function:
+     * 1. Extracts the Vike configuration from Vite's config
+     * 2. Checks if standalone mode is enabled for server builds
+     * 3. Merges default externals with any user-provided externals
+     * 4. Updates the Vite SSR configuration to exclude these packages
+     * 
+     * Externalized packages will be:
+     * - Not bundled into the final output
+     * - Expected to exist in the node_modules directory at runtime
+     * - Handled properly by our dependency processing later
      */
     config(config) {
-      assert(config);
+      assert(config, "Plugin config should be defined");
 
       const vikeConfig = getVikeConfig(config);
-      assert(vikeConfig?.config);
+      assert(vikeConfig?.config, "Vike config should be available");
 
       const serverConfig = vikeConfig.config.server?.[0];
       const standaloneConfig =
@@ -121,6 +135,7 @@ export function standaloneExternals(): Plugin {
           ? serverConfig.standalone
           : undefined;
 
+      // Only apply externals if standalone config is present
       if (!standaloneConfig) return;
 
       // Get externals from config
@@ -130,7 +145,7 @@ export function standaloneExternals(): Plugin {
           ? standaloneConfig.esbuild.external
           : [];
 
-      assert(Array.isArray(configExternals));
+      assert(Array.isArray(configExternals), "Config externals must be an array");
 
       return {
         ssr: {
@@ -144,9 +159,26 @@ export function standaloneExternals(): Plugin {
     closeBundle: {
       sequential: true,
       order: "post",
+      /**
+       * Process standalone build files after bundling completes
+       * 
+       * This hook runs at the very end of the Vite build process after all
+       * files have been generated. It's responsible for:
+       * 
+       * 1. Identifying standalone server files (those with ".standalone." in their name)
+       * 2. Tracing all their dependencies
+       * 3. Copying these dependencies to the output directory with proper structure
+       * 
+       * The hook only processes files if they match the standalone pattern.
+       * This allows selective application of the dependency processing.
+       * 
+       * Why it uses "sequential" and "post" order:
+       * - Sequential ensures no race conditions with other plugins
+       * - Post ensures all other plugins have completed their work
+       */
       async handler() {
         const config = this.environment.config;
-        assert(config?.root && config?.build?.outDir);
+        assert(config?.root && config?.build?.outDir, "Build config must include root and outDir");
 
         const root = toPosixPath(config.root);
         const outDir = toPosixPath(config.build.outDir);
@@ -154,13 +186,17 @@ export function standaloneExternals(): Plugin {
           ? outDir
           : path.join(root, outDir);
 
-        // Find standalone output files
+        // Find standalone output files (those with ".standalone." in their name)
+        // These are special server entry points that need dependency processing
         const files = await fs.readdir(outDirAbs);
         const standaloneFiles = files
           .filter((file) => file.includes(".standalone."))
           .map((file) => path.join(outDirAbs, file));
 
-        if (standaloneFiles.length === 0) return;
+        if (standaloneFiles.length === 0) {
+          console.log("No standalone files found, skipping dependency processing.");
+          return;
+        }
 
         await processStandalone(standaloneFiles, root, outDirAbs);
       },
@@ -168,8 +204,18 @@ export function standaloneExternals(): Plugin {
   };
 }
 
+// -----------------------------------------------------------------------------
+// Core Processing Functions
+// -----------------------------------------------------------------------------
+
 /**
  * Main function to process standalone build files
+ * 
+ * This is the entry point for dependency processing that:
+ * 1. Traces dependencies for the standalone files
+ * 2. Analyzes package versions and workspace structure
+ * 3. Copies dependencies with proper path mapping
+ * 
  * @param standaloneFiles - List of entry files
  * @param root - Project root directory
  * @param outDirAbs - Absolute path to output directory
@@ -179,20 +225,21 @@ async function processStandalone(
   root: string,
   outDirAbs: string
 ): Promise<void> {
-  assert(Array.isArray(standaloneFiles));
-  assert(standaloneFiles.every((file) => typeof file === "string"));
-  assert(typeof root === "string");
-  assert(typeof outDirAbs === "string");
+  assert(Array.isArray(standaloneFiles), "Standalone files must be an array");
+  assert(standaloneFiles.every((file) => typeof file === "string"), "Each file must be a string");
+  assert(typeof root === "string", "Root path must be a string");
+  assert(typeof outDirAbs === "string", "Output directory must be a string");
 
   console.log("Processing standalone build dependencies...");
 
-  // Skip yarn PnP
+  // Skip yarn PnP which uses different module resolution
   if (isYarnPnP()) {
     console.warn("Yarn PnP is not supported for standalone builds.");
     return;
   }
 
   const workspaceRoot = toPosixPath(searchForWorkspaceRoot(root));
+  assert(workspaceRoot, "Failed to find workspace root");
 
   // Step 1: Trace dependencies and build dependency graph
   const { dependencies, dependencyInfo } = await traceDependencies(
@@ -201,12 +248,15 @@ async function processStandalone(
     outDirAbs
   );
   
-  if (dependencies.length === 0) return;
+  if (dependencies.length === 0) {
+    console.log("No dependencies found to process.");
+    return;
+  }
 
   // Step 2: Analyze packages and count versions
   const packageInfo = await analyzePackages(dependencies, workspaceRoot);
-  assert(packageInfo?.versionCounts instanceof Map);
-  assert(packageInfo?.workspacePackages instanceof Map);
+  assert(packageInfo?.versionCounts instanceof Map, "Version counts must be a Map");
+  assert(packageInfo?.workspacePackages instanceof Map, "Workspace packages must be a Map");
 
   // Step 3: Copy dependencies with proper path mapping
   await copyDependencies(
@@ -221,7 +271,11 @@ async function processStandalone(
 }
 
 /**
- * Trace all required dependencies using Vercel's NFT
+ * Trace all required dependencies using Vercel's Node File Tracer
+ * 
+ * Finds all files required by the entry points and builds a dependency graph
+ * showing the relationships between files.
+ * 
  * @param entryFiles - List of entry files to trace from
  * @param workspaceRoot - Root of the workspace
  * @param outDirAbs - Output directory to exclude
@@ -232,16 +286,18 @@ async function traceDependencies(
   workspaceRoot: string,
   outDirAbs: string
 ): Promise<{ dependencies: string[]; dependencyInfo: DependencyInfo }> {
-  assert(Array.isArray(entryFiles));
-  assert(entryFiles.every((file) => typeof file === "string"));
-  assert(typeof workspaceRoot === "string");
-  assert(typeof outDirAbs === "string");
+  assert(Array.isArray(entryFiles), "Entry files must be an array");
+  assert(entryFiles.every((file) => typeof file === "string"), "Each entry file must be a string");
+  assert(typeof workspaceRoot === "string", "Workspace root must be a string");
+  assert(typeof outDirAbs === "string", "Output directory must be a string");
 
+  // Use Vercel's NFT to trace all dependencies
   const result = await nodeFileTrace(entryFiles, { base: workspaceRoot });
-  assert(result?.fileList && result?.reasons);
+  assert(result?.fileList && result?.reasons, "File tracing must return fileList and reasons");
 
-  // Calculate relative output directory path
+  // Calculate relative output directory path to exclude files already in output
   const relOutDir = path.relative(workspaceRoot, outDirAbs);
+  assert(relOutDir, "Unable to determine relative output directory");
 
   // Filter relevant files and normalize paths
   const dependencies = [...result.fileList]
@@ -254,11 +310,13 @@ async function traceDependencies(
     )
     .map(toPosixPath);
 
-  assert(Array.isArray(dependencies));
-  assert(dependencies.every((dep) => typeof dep === "string"));
+  assert(Array.isArray(dependencies), "Dependencies must be an array");
+  assert(dependencies.every((dep) => typeof dep === "string"), "Each dependency must be a string");
 
   // Build dependency relationships
   const dependencyInfo = buildDependencyGraph(dependencies, result.reasons);
+  assert(dependencyInfo.importedBy instanceof Map, "importedBy must be a Map");
+  assert(dependencyInfo.imports instanceof Map, "imports must be a Map");
 
   console.log(`Found ${dependencies.length} dependencies to copy`);
   
@@ -267,14 +325,40 @@ async function traceDependencies(
 
 /**
  * Builds a dependency graph from tracing results
+ * 
+ * Creates a bidirectional graph showing which files import which other files,
+ * essential for preserving relative import relationships.
+ * 
+ * The function builds two complementary data structures:
+ * 
+ * 1. importedBy: Maps from a file to all files that import it
+ *    - Key: The file being imported
+ *    - Value: Set of files that import this file
+ *    - Example: { "utils/helper.js" → Set["app.js", "components/form.js"] }
+ *    - Answers: "Who imports this file?"
+ * 
+ * 2. imports: Maps from a file to all files it imports
+ *    - Key: The file doing the importing
+ *    - Value: Set of files that it imports
+ *    - Example: { "app.js" → Set["utils/helper.js", "components/button.js"] }
+ *    - Answers: "What does this file import?"
+ * 
+ * Having both directions is critical for:
+ * - Efficiently finding all related files when relocating
+ * - Properly maintaining relative import paths
+ * - Ensuring all dependencies remain resolvable
+ * 
  * @param files - List of files
  * @param reasons - Reasons map from nodeFileTrace
  * @returns Dependency information with relationships between files
  */
 function buildDependencyGraph(
   files: string[],
-  reasons: Map<string, { type: string[], parents?: Set<string> }>
+  reasons: Map<string, TraceReason>
 ): DependencyInfo {
+  assert(Array.isArray(files), "Files must be an array");
+  assert(reasons instanceof Map, "Reasons must be a Map");
+  
   // Maps from file to the set of files that import it
   const importedBy = new Map<string, Set<string>>();
   
@@ -308,6 +392,24 @@ function buildDependencyGraph(
 
 /**
  * Analyze package.json files to identify versions and workspace packages
+ * 
+ * This function scans all package.json files to build a comprehensive map of:
+ * 1. How many versions of each package exist (for hoisting decisions)
+ * 2. Which directories contain workspace packages (vs node_modules packages)
+ * 
+ * Version detection works by identifying unique locations where a package appears:
+ * - Each distinct directory containing a package.json with the same name counts as a "version"
+ * - This is a heuristic that works well in practice for detecting duplicates
+ * 
+ * For example, if react appears in:
+ * - node_modules/react/
+ * - node_modules/ui-library/node_modules/react/
+ * 
+ * Then react has 2 versions, and won't be hoisted to prevent resolution conflicts.
+ * 
+ * Workspace packages are identified as any package.json NOT inside node_modules.
+ * This lets us map project-local packages to their correct location in node_modules.
+ * 
  * @param files - List of files to analyze
  * @param workspaceRoot - Root of the workspace
  * @returns Package information
@@ -316,14 +418,17 @@ async function analyzePackages(
   files: string[],
   workspaceRoot: string
 ): Promise<PackageInfo> {
-  assert(Array.isArray(files));
-  assert(files.every((file) => typeof file === "string"));
-  assert(typeof workspaceRoot === "string");
+  assert(Array.isArray(files), "Files must be an array");
+  assert(files.every((file) => typeof file === "string"), "Each file must be a string");
+  assert(typeof workspaceRoot === "string", "Workspace root must be a string");
 
+  // Track unique locations of each package name
   const packageLocations = new Map<string, Set<string>>();
+  
+  // Track workspace packages (those outside node_modules)
   const workspacePackages = new Map<string, string>();
 
-  // Process all package.json files
+  // Process all package.json files to build our maps
   for (const file of files) {
     if (!file.endsWith("package.json")) continue;
 
@@ -332,8 +437,9 @@ async function analyzePackages(
       const content = await fs.readFile(fullPath, "utf-8");
       const pkg = JSON.parse(content);
 
+      // Skip package.json files without a name
       if (!pkg.name) continue;
-      assert(typeof pkg.name === "string");
+      assert(typeof pkg.name === "string", "Package name must be a string");
 
       const dir = path.dirname(file);
 
@@ -355,6 +461,7 @@ async function analyzePackages(
   }
 
   // Convert locations to version counts
+  // Each unique location where a package appears counts as a distinct version
   const versionCounts = new Map<string, number>();
   for (const [name, locations] of packageLocations.entries()) {
     versionCounts.set(name, locations.size);
@@ -365,6 +472,10 @@ async function analyzePackages(
 
 /**
  * Copy dependencies to output directory with proper structure
+ * 
+ * Implements the core logic for applying the hoisting and mapping rules,
+ * including preserving relative import relationships.
+ * 
  * @param files - List of files to copy
  * @param workspaceRoot - Root of the workspace
  * @param outDirAbs - Output directory
@@ -378,12 +489,14 @@ async function copyDependencies(
   packageInfo: PackageInfo,
   dependencyInfo: DependencyInfo
 ): Promise<void> {
-  assert(Array.isArray(files));
-  assert(files.every((file) => typeof file === "string"));
-  assert(typeof workspaceRoot === "string");
-  assert(typeof outDirAbs === "string");
-  assert(packageInfo?.versionCounts instanceof Map);
-  assert(packageInfo?.workspacePackages instanceof Map);
+  assert(Array.isArray(files), "Files must be an array");
+  assert(files.every((file) => typeof file === "string"), "Each file must be a string");
+  assert(typeof workspaceRoot === "string", "Workspace root must be a string");
+  assert(typeof outDirAbs === "string", "Output directory must be a string");
+  assert(packageInfo?.versionCounts instanceof Map, "Version counts must be a Map");
+  assert(packageInfo?.workspacePackages instanceof Map, "Workspace packages must be a Map");
+  assert(dependencyInfo.importedBy instanceof Map, "importedBy must be a Map");
+  assert(dependencyInfo.imports instanceof Map, "imports must be a Map");
 
   // First, determine the destination paths for all files
   const destPaths = new Map<string, string>();
@@ -417,7 +530,7 @@ async function copyDependencies(
   
   // Now copy all files to their final destinations
   const limit = pLimit(10); // Limit concurrent file operations
-  const processed = new Set<string>();
+  const processed = new Set<string>(); // Track already processed files to avoid duplicates
 
   await Promise.all(
     files.map((file) =>
@@ -425,6 +538,7 @@ async function copyDependencies(
         try {
           const sourcePath = path.join(workspaceRoot, file);
           const destPath = destPaths.get(file)!;
+          assert(destPath, `Destination path not found for ${file}`);
 
           // Skip directories
           const stats = await fs.stat(sourcePath);
@@ -447,6 +561,26 @@ async function copyDependencies(
 
 /**
  * Adjusts destination paths to preserve relative imports for a relocated file
+ * 
+ * Problem: When we move a file from its original location to a new location
+ * (like hoisting it to node_modules), any relative imports it contains would break.
+ * 
+ * Solution: This function:
+ * 1. Identifies files that are imported via relative paths (like './utils' or '../helpers')
+ * 2. Relocates these imported files to maintain the same relative path relationship
+ * 3. Recursively applies this process to the relocated files
+ * 
+ * Example:
+ * If we move: 
+ *   src/features/auth/login.js → node_modules/my-app/features/auth/login.js
+ * And login.js imports: 
+ *   import '../utils/validation.js'
+ * 
+ * We must also move:
+ *   src/features/utils/validation.js → node_modules/my-app/features/utils/validation.js
+ * 
+ * This recursive process ensures entire chains of relative imports continue to work.
+ * 
  * @param sourceFile - The file being relocated
  * @param destPath - The destination path for the source file
  * @param dependencyInfo - The dependency graph information
@@ -461,7 +595,12 @@ function adjustPathsForRelativeImports(
   destPaths: Map<string, string>,
   workspaceRoot: string,
   outDirAbs: string
-) {
+): void {
+  assert(typeof sourceFile === "string", "Source file must be a string");
+  assert(typeof destPath === "string", "Destination path must be a string");
+  assert(dependencyInfo.imports instanceof Map, "Imports must be a Map");
+  assert(destPaths instanceof Map, "Destination paths must be a Map");
+  
   // Get files that this file imports
   const importedFiles = dependencyInfo.imports.get(sourceFile);
   if (!importedFiles || importedFiles.size === 0) return;
@@ -470,21 +609,32 @@ function adjustPathsForRelativeImports(
   const destDir = path.dirname(destPath);
   
   for (const importedFile of importedFiles) {
-    // Check if this is likely a relative import (simple heuristic)
-    const relPathFromSource = path.relative(sourceDir, importedFile);
+    // Determine if this is likely a relative import by checking the relative path
+  // We use Node's path.relative to calculate how the files relate to each other
+  const relPathFromSource = path.relative(sourceDir, importedFile);
     
-    // If it starts with .. or ., it's probably a relative import
-    if (relPathFromSource.startsWith('..') || relPathFromSource.startsWith('.')) {
+  // If the relative path starts with ".." or ".", it's a relative import
+  // Examples:
+  // - "../utils/helpers.js" (parent directory import)
+  // - "./constants.js" (same directory import)
+  // - "../../lib/common.js" (ancestor directory import)
+  //
+  // This doesn't match absolute imports like:
+  // - "lodash" (a package import)
+  // - "src/utils/helpers.js" (an import from project root)
+  if (relPathFromSource.startsWith('..') || relPathFromSource.startsWith('.')) {
       // Preserve the relative relationship by placing the imported file
       // at the same relative location from the new destination
       const newImportDest = path.join(destDir, relPathFromSource);
       
       // Only update if not already relocated to a workspace package or hoisted
+      // This avoids overriding more important relocation rules
       const currentDest = destPaths.get(importedFile);
       if (currentDest && !currentDest.includes('/node_modules/')) {
         destPaths.set(importedFile, newImportDest);
         
         // Recursively adjust for files imported by this file
+        // This ensures entire chains of relative imports are preserved
         adjustPathsForRelativeImports(
           importedFile,
           newImportDest,
@@ -500,6 +650,29 @@ function adjustPathsForRelativeImports(
 
 /**
  * Map a source file path to its destination path based on hoisting rules
+ * 
+ * This function is the heart of the plugin's logic, implementing a cascading decision
+ * tree that determines where each file should be placed in the output directory.
+ * 
+ * Rules are applied in priority order:
+ * 
+ * 1. VERSION-BASED HOISTING:
+ *    - If a package exists in exactly ONE version across the entire dependency tree
+ *    - THEN: Hoist it to node_modules/[packageName]/ regardless of its original location
+ *    - WHY: This reduces duplication while preserving Node.js resolution compatibility
+ * 
+ * 2. WORKSPACE PACKAGE MAPPING:
+ *    - If a file is part of a workspace package (not in node_modules)
+ *    - THEN: Place it in node_modules/[packageName]/[relativePath]
+ *    - WHY: This makes local packages work with standard Node.js resolution
+ * 
+ * 3. DEFAULT MAPPING:
+ *    - If a package has MULTIPLE versions (didn't qualify for rule 1)
+ *    - THEN: Preserve its location under node_modules/ but flatten the structure
+ *    - WHY: This maintains separate versions while simplifying nesting
+ * 
+ * If none of these rules apply, the file is copied maintaining its relative path.
+ * 
  * @param file - Source file path
  * @param outDirAbs - Output directory
  * @param packageInfo - Package information
@@ -510,16 +683,16 @@ function mapFilePath(
   outDirAbs: string,
   packageInfo: PackageInfo
 ): string {
-  assert(typeof file === "string");
-  assert(typeof outDirAbs === "string");
-  assert(packageInfo?.versionCounts instanceof Map);
-  assert(packageInfo?.workspacePackages instanceof Map);
+  assert(typeof file === "string", "File must be a string");
+  assert(typeof outDirAbs === "string", "Output directory must be a string");
+  assert(packageInfo?.versionCounts instanceof Map, "Version counts must be a Map");
+  assert(packageInfo?.workspacePackages instanceof Map, "Workspace packages must be a Map");
 
   // RULE 1: Single-version packages are hoisted (regardless of location)
   if (file.includes("node_modules/")) {
     // Extract package name from last node_modules segment
     const parts = file.split("node_modules/").filter(Boolean);
-    assert(Array.isArray(parts));
+    assert(Array.isArray(parts), "Path parts must be an array");
 
     // Skip if we don't have any parts after node_modules
     if (parts.length === 0) {
@@ -527,7 +700,7 @@ function mapFilePath(
     }
 
     const lastPart = parts[parts.length - 1];
-    assert(typeof lastPart === "string");
+    assert(typeof lastPart === "string", "Last part must be a string");
 
     const packageName = extractPackageName(lastPart);
 
@@ -556,9 +729,9 @@ function mapFilePath(
     packageInfo.workspacePackages
   );
   if (workspaceMatch) {
-    assert(workspaceMatch.packageName);
-    assert(typeof workspaceMatch.packageName === "string");
-    assert(typeof workspaceMatch.relativePath === "string");
+    assert(workspaceMatch.packageName, "Workspace match must have package name");
+    assert(typeof workspaceMatch.packageName === "string", "Package name must be a string");
+    assert(typeof workspaceMatch.relativePath === "string", "Relative path must be a string");
 
     return path.join(
       outDirAbs,
@@ -571,14 +744,14 @@ function mapFilePath(
   // RULE 3: Multi-version packages preserve their structure in node_modules
   if (file.includes("node_modules/")) {
     const parts = file.split("node_modules/").filter(Boolean);
-    assert(Array.isArray(parts));
+    assert(Array.isArray(parts), "Path parts must be an array");
 
     if (parts.length === 0) {
       return path.join(outDirAbs, file);
     }
 
     const lastPart = parts[parts.length - 1];
-    assert(typeof lastPart === "string");
+    assert(typeof lastPart === "string", "Last part must be a string");
 
     return path.join(outDirAbs, "node_modules", lastPart);
   }
@@ -587,8 +760,16 @@ function mapFilePath(
   return path.join(outDirAbs, file);
 }
 
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+
 /**
  * Find if a file is inside a workspace package
+ * 
+ * Checks if a file is located within a workspace package directory and
+ * provides information needed to map it to node_modules.
+ * 
  * @param file - File path to check
  * @param workspacePackages - Map of workspace package paths to names
  * @returns Match information if found, null otherwise
@@ -597,23 +778,37 @@ function findWorkspaceMatch(
   file: string,
   workspacePackages: Map<string, string>
 ): { packageName: string; relativePath: string } | null {
-  assert(typeof file === "string");
-  assert(workspacePackages instanceof Map);
+  assert(typeof file === "string", "File must be a string");
+  assert(workspacePackages instanceof Map, "Workspace packages must be a Map");
 
   // Sort by length descending to match the most specific path first
+  // This ensures that nested packages are handled correctly
+  // 
+  // Example:
+  //   If we have workspace packages at:
+  //     - "packages/core" (packageName: "core")
+  //     - "packages/core/utilities" (packageName: "core-utilities")
+  //   And we're checking a file at "packages/core/utilities/src/index.js"
+  //
+  //   Without sorting by length:
+  //     We might check "packages/core" first and incorrectly match to "core"
+  //   
+  //   With sorting by length (longest first):
+  //     We check "packages/core/utilities" first and correctly match to "core-utilities"
+  //     This prevents files in nested packages from being incorrectly attributed to parent packages
   const dirs = [...workspacePackages.keys()].sort(
     (a, b) => b.length - a.length
   );
-  assert(Array.isArray(dirs));
+  assert(Array.isArray(dirs), "Directories must be an array");
 
   for (const dir of dirs) {
-    assert(typeof dir === "string");
+    assert(typeof dir === "string", "Directory must be a string");
 
     if (file === dir || file.startsWith(dir + "/")) {
       const packageName = workspacePackages.get(dir);
       if (!packageName) continue; // Skip if package name not found
 
-      assert(typeof packageName === "string");
+      assert(typeof packageName === "string", "Package name must be a string");
       const relativePath = file === dir ? "" : file.slice(dir.length + 1);
 
       return { packageName, relativePath };
@@ -625,11 +820,14 @@ function findWorkspaceMatch(
 
 /**
  * Extract package name from a path
+ * 
+ * Handles both regular packages and scoped packages (@org/name)
+ * 
  * @param pathStr - Path to extract from
  * @returns Package name or null if not found
  */
 function extractPackageName(pathStr: string): string | null {
-  assert(typeof pathStr === "string");
+  assert(typeof pathStr === "string", "Path must be a string");
 
   if (!pathStr) return null;
 
@@ -639,7 +837,7 @@ function extractPackageName(pathStr: string): string | null {
   if (firstSlash === -1) return pathStr;
 
   const firstPart = pathStr.substring(0, firstSlash);
-  assert(typeof firstPart === "string");
+  assert(typeof firstPart === "string", "First part must be a string");
 
   // Handle scoped packages (@org/name)
   if (firstPart.startsWith("@")) {
@@ -653,6 +851,44 @@ function extractPackageName(pathStr: string): string | null {
 }
 
 /**
+ * Converts a path to POSIX format for cross-platform compatibility
+ * 
+ * Why this matters:
+ * - Node.js accepts both forward (/) and backward (\) slashes on Windows
+ * - However, many string operations and path comparisons can break with mixed slashes
+ * - Using consistent POSIX paths (forward slashes only) prevents subtle bugs
+ * 
+ * For example:
+ * - Windows path: "C:\\Users\\Developer\\project\\node_modules\\react"
+ * - Converted to: "C:/Users/Developer/project/node_modules/react"
+ * 
+ * This makes path operations like string comparisons, startsWith, and splitting
+ * work consistently across all platforms.
+ * 
+ * @param path - Path to convert
+ * @returns Path with forward slashes
+ */
+function toPosixPath(path: string): string {
+  assert(typeof path === "string", "Path must be a string");
+  
+  const pathPosix = path.split("\\").join("/");
+  assertPosixPath(pathPosix);
+  return pathPosix;
+}
+
+/**
+ * Asserts that a path is in valid POSIX format
+ * @param path - Path to validate
+ */
+function assertPosixPath(path: string): void {
+  assert(path !== null, "Path cannot be null");
+  assert(typeof path === "string", "Path must be a string");
+  assert(path !== "", "Path cannot be empty");
+  assert(path, "Path must exist");
+  assert(!path.includes("\\"), "Path cannot contain backslashes");
+}
+
+/**
  * Check if Yarn PnP is being used
  * @returns True if Yarn PnP is detected
  */
@@ -663,4 +899,28 @@ function isYarnPnP(): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Assert helper for internal errors
+ * @param condition - Condition to check
+ * @param message - Optional error message to display
+ * @throws Error if condition is falsy
+ */
+function assert(condition: unknown, message?: string): asserts condition {
+  if (condition) return;
+  throw new Error(
+    message || "You stumbled upon a bug in vike-server-externals's source code. Please report this issue on GitHub."
+  );
+}
+
+/**
+ * Assert helper for usage errors
+ * @param condition - Condition to check
+ * @param message - Error message to display
+ * @throws Error if condition is falsy
+ */
+function assertUsage(condition: unknown, message: string): asserts condition {
+  if (condition) return;
+  throw new Error(`[vike-server-externals][Wrong Usage] ${message}`);
 }
