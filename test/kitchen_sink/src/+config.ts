@@ -16,6 +16,7 @@ export default {
           "package3",
           "package999",
         ],
+        // external: ["*"]
       },
     },
   },
