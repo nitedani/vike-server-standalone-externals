@@ -49,7 +49,7 @@ import pLimit from "p-limit";
  * 
  * Example:
  * - @node-rs/argon2: Contains native Rust bindings for argon2 hashing
- * - @prisma/client: Dynamically loads generated DB client code, contains native Rust bindings for the query engine
+ * - @prisma/client: Dynamically loads generated DB client code, constains native Rust bindings
  * - sharp: Contains native image processing dependencies
  */
 const DEFAULT_EXTERNALS = ["@node-rs/argon2", "@prisma/client", "sharp"];
@@ -537,8 +537,11 @@ async function copyDependencies(
       limit(async () => {
         try {
           const sourcePath = path.join(workspaceRoot, file);
-          const destPath = destPaths.get(file)!;
-          assert(destPath, `Destination path not found for ${file}`);
+          const destPath = ensurePathIsWithinDirectory(
+            destPaths.get(file)!,
+            outDirAbs
+          );
+          assert(destPath, `Destination path not found or invalid for ${file}`);
 
           // Skip directories
           const stats = await fs.stat(sourcePath);
@@ -610,22 +613,25 @@ function adjustPathsForRelativeImports(
   
   for (const importedFile of importedFiles) {
     // Determine if this is likely a relative import by checking the relative path
-  // We use Node's path.relative to calculate how the files relate to each other
-  const relPathFromSource = path.relative(sourceDir, importedFile);
-    
-  // If the relative path starts with ".." or ".", it's a relative import
-  // Examples:
-  // - "../utils/helpers.js" (parent directory import)
-  // - "./constants.js" (same directory import)
-  // - "../../lib/common.js" (ancestor directory import)
-  //
-  // This doesn't match absolute imports like:
-  // - "lodash" (a package import)
-  // - "src/utils/helpers.js" (an import from project root)
-  if (relPathFromSource.startsWith('..') || relPathFromSource.startsWith('.')) {
+    // We use Node's path.relative to calculate how the files relate to each other
+    const relPathFromSource = path.relative(sourceDir, importedFile);
+      
+    // If the relative path starts with ".." or ".", it's a relative import
+    // Examples:
+    // - "../utils/helpers.js" (parent directory import)
+    // - "./constants.js" (same directory import)
+    // - "../../lib/common.js" (ancestor directory import)
+    //
+    // This doesn't match absolute imports like:
+    // - "lodash" (a package import)
+    // - "src/utils/helpers.js" (an import from project root)
+    if (relPathFromSource.startsWith('..') || relPathFromSource.startsWith('.')) {
       // Preserve the relative relationship by placing the imported file
       // at the same relative location from the new destination
-      const newImportDest = path.join(destDir, relPathFromSource);
+      let newImportDest = path.join(destDir, relPathFromSource);
+      
+      // Ensure the new path doesn't escape the output directory (security check)
+      newImportDest = ensurePathIsWithinDirectory(newImportDest, outDirAbs);
       
       // Only update if not already relocated to a workspace package or hoisted
       // This avoids overriding more important relocation rules
@@ -765,6 +771,36 @@ function mapFilePath(
 // -----------------------------------------------------------------------------
 
 /**
+ * Ensures a path doesn't escape outside a specific directory
+ * 
+ * This is a critical security function that prevents directory traversal attacks
+ * when handling relative paths. Without this, deeply nested '../../../../../' paths
+ * could write files outside the intended output directory.
+ * 
+ * @param filePath - The path to check and sanitize
+ * @param containingDir - The directory the path must remain within
+ * @returns A safe path guaranteed to be within the containing directory
+ */
+function ensurePathIsWithinDirectory(filePath: string, containingDir: string): string {
+  assert(typeof filePath === "string", "File path must be a string");
+  assert(typeof containingDir === "string", "Containing directory must be a string");
+  
+  // Normalize both paths
+  const normalizedPath = path.normalize(filePath);
+  const normalizedDir = path.normalize(containingDir);
+  
+  // Check if the path is within the directory
+  if (!normalizedPath.startsWith(normalizedDir)) {
+    console.warn(`Security warning: Path would escape output directory: ${filePath}`);
+    
+    // Return a safe path within the directory using the original file name
+    return path.join(normalizedDir, path.basename(normalizedPath));
+  }
+  
+  return normalizedPath;
+}
+
+/**
  * Find if a file is inside a workspace package
  * 
  * Checks if a file is located within a workspace package directory and
@@ -782,7 +818,6 @@ function findWorkspaceMatch(
   assert(workspacePackages instanceof Map, "Workspace packages must be a Map");
 
   // Sort by length descending to match the most specific path first
-  // This ensures that nested packages are handled correctly
   // 
   // Example:
   //   If we have workspace packages at:
