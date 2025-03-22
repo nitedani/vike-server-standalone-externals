@@ -1,0 +1,19 @@
+{
+    "name": "",
+    "private": true,
+    "version": "0.0.0",
+    "type": "module",
+    "pnpm": {
+        "overrides": {
+            "vike-server-standalone-externals": "link:./packages/vike-server-standalone-externals/",
+            "lodash_exporter_1": "link:./test/lodash_exporter_1/",
+            "lodash_exporter_2": "link:./test/lodash_exporter_2/"
+        }
+    },
+    "devDependencies": {
+        "typescript": "^5.8.2"
+    },
+    "scripts": {
+        "build": "pnpm --recursive --filter {packages/*} --filter {examples/*}  run build"
+    }
+}

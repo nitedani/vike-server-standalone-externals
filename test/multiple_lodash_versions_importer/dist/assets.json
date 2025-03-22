@@ -1,0 +1,18 @@
+{
+  "node_modules/vike/dist/esm/client/server-routing-runtime/entry.js": {
+    "file": "assets/entries/entry-server-routing.lCwni81v.js",
+    "name": "entries/entry-server-routing",
+    "src": "node_modules/vike/dist/esm/client/server-routing-runtime/entry.js",
+    "isEntry": true,
+    "dynamicImports": [
+      "virtual:vike:pageConfigValuesAll:client:/src/pages/index"
+    ]
+  },
+  "virtual:vike:pageConfigValuesAll:client:/src/pages/index": {
+    "file": "assets/entries/src_pages_index.BVWHN_ai.js",
+    "name": "entries/src/pages/index",
+    "src": "virtual:vike:pageConfigValuesAll:client:/src/pages/index",
+    "isEntry": true,
+    "isDynamicEntry": true
+  }
+}

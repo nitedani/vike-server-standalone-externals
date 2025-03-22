@@ -1,0 +1,25 @@
+{
+  "name": "multiple_lodash_versions_importer",
+  "version": "1.0.0",
+  "description": "",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vike dev",
+    "build": "vike build",
+    "start": "NODE_ENV=production node dist/server/index.standalone.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node": "^22.13.11",
+    "hono": "^4.7.5",
+    "vike": "^0.4.226",
+    "vike-server": "1.0.0-beta.2",
+    "vite": "^6.2.2",
+    "vike-server-standalone-externals": "1.0.0",
+    "lodash": "4.17.21",
+    "lodash_exporter_1": "*"
+  }
+}
